@@ -22,6 +22,49 @@ void check_memory_node(void *memory, int num) {
     }
 }
 
+struct bitmask *set_numa_interleave() {
+    struct bitmask *mask;
+    struct bitmask *old_mask;
+
+    // Check if NUMA is available
+    if (numa_available() == -1) {
+        fprintf(stderr, "NUMA is not available\n");
+        return NULL;
+    }
+
+    mask = numa_bitmask_alloc(numa_max_node() + 1);
+    if (!mask) {
+        fprintf(stderr, "Failed to allocate bitmask\n");
+        return NULL;
+    }
+
+    // Save previous interleave mask and strict mode
+    old_mask = numa_get_interleave_mask();
+
+    // Set the interleave mask on the specified NUMA nodes
+    numa_bitmask_setbit(mask, 2);
+    numa_bitmask_setbit(mask, 3);
+    numa_set_interleave_mask(mask);
+
+    // Set strict mode to bind memory to the specified node
+    numa_set_strict(1);
+
+    numa_bitmask_free(mask);
+    return old_mask;
+}
+
+// Function to unset NUMA interleaving, takes the old mask as an argument
+void unset_numa_interleave(struct bitmask *old_mask) {
+    if (!old_mask) {
+        fprintf(stderr, "No previous interleave mask provided\n");
+        return;
+    }
+
+    numa_set_interleave_mask(old_mask);
+    numa_set_strict(0);
+    numa_bitmask_free(old_mask);
+}
+
 void* numa_alloc_node(size_t size, int node) {
     struct bitmask *mask = numa_bitmask_alloc(numa_max_node() + 1);
 
@@ -64,45 +107,17 @@ void* numa_alloc_node(size_t size, int node) {
 }
 
 void* numa_alloc_interleave(size_t size) {
-    struct bitmask *mask = numa_bitmask_alloc(numa_max_node() + 1);
-
-    // Check if NUMA is available
-    if (numa_available() == -1) {
-        fprintf(stderr, "NUMA is not available\n");
-        numa_bitmask_free(mask);
-        return NULL;
-    }
-
-    // Save previous interleave mask and strict mode
-    struct bitmask *old_mask = numa_get_interleave_mask();
-
-    // Set the interleave mask on the specified NUMA nodes
-    numa_bitmask_setbit(mask, 2);
-    numa_bitmask_setbit(mask, 3);
-    numa_set_interleave_mask(mask);
-
-    // Set strict mode to bind memory to the specified node
-    numa_set_strict(1);
+    struct bitmask *old_mask = set_numa_interleave();
 
     // Allocate memory on the specified NUMA node
     void *memory = numa_alloc(size);
     if (!memory) {
         fprintf(stderr, "Memory allocation failed on node 2,3\n");
-        // Restore previous settings
-        numa_set_interleave_mask(old_mask);
-        numa_set_strict(0);
-        numa_bitmask_free(old_mask);
-        numa_bitmask_free(mask);
+        unset_numa_interleave(old_mask);
         return NULL;
     }
 
-    // check_memory_node(memory, 4);
-
-    // Restore previous settings
-    numa_set_interleave_mask(old_mask);
-    numa_set_strict(0);
-    numa_bitmask_free(old_mask);
-    numa_bitmask_free(mask);
+    unset_numa_interleave(old_mask);
 
     return memory;
 }

@@ -1,4 +1,4 @@
-from numa_alloc import numa_alloc_tensor, numa_free_tensor
+from numa_alloc import numa_alloc_tensor, numa_free_tensor, set_numa_interleave, unset_numa_interleave, check_tensor_node
 import torch
 import time
 import argparse
