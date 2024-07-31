@@ -5,6 +5,10 @@ import argparse
 import numpy as np
 from queue import Queue
 from threading import Thread
+# import multiprocessing 
+# multiprocessing.set_start_method('spawn', force=True)
+from multiprocessing import Process
+import math
 
 def realloc_to_numa(tensor):
     numa_tensor = numa_alloc_tensor(tensor.shape, tensor.dtype)
@@ -87,28 +91,27 @@ for i in range(iterations):
                 start = time.time()
                 c = torch.matmul(a, b)
                 end = time.time()
+        print("Test 3.2")
         queue.put(end - start)
         queue.put(c.dtype)
 
     def memcpy(queue):
-        if bwshare == 1 or bwshare == 2:
-            torch.cuda.synchronize()
-            start = time.time()
-            d_to.copy_(d_from, non_blocking=True)
-            torch.cuda.synchronize()
-            end = time.time()
-            queue.put(end - start)
-        else:
-            queue.put(0)
+        start = time.time()
+        end = time.time()
+        queue.put(end - start)
     
+    print("Test 1")
     memcpy_queue = Queue()
     compute_queue = Queue()
-    memcpy_thread = Thread(target=memcpy, args=(memcpy_queue,))
-    compute_thread = Thread(target=compute, args=(compute_queue,))
+    memcpy_thread = Process(target=memcpy, args=(compute_queue,))
+    compute_thread = Process(target=compute, args=(compute_queue,))
+    print("Test 2")
     memcpy_thread.start()
     compute_thread.start()
+    print("Test 3")
     memcpy_thread.join()
     compute_thread.join()
+    print("Test 4")
 
     memcpy_time = memcpy_queue.get()
     compute_time = compute_queue.get()

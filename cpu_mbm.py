@@ -3,9 +3,13 @@ import torch
 import time
 import argparse
 import numpy as np
-from queue import Queue
-from threading import Thread
 import math
+import os
+import psutil
+
+from multiprocessing import Process, Queue, Barrier
+# from threading import Thread, Barrier
+# from queue import Queue
 
 def realloc_to_numa(tensor):
     numa_tensor = numa_alloc_tensor(tensor.shape, tensor.dtype)
@@ -44,52 +48,51 @@ bwshare = args.bwshare
 
 data_type = torch.bfloat16 if amx else torch.float32
 
+def memcpy_process(barrier, queue, data_type, args, iterations):
+    p = psutil.Process(os.getpid())
+    p.cpu_affinity([0])
+    for i in range(iterations):
+        if args.bwshare == 2:
+            d_from = realloc_to_numa(torch.rand(args.m, args.n).to(data_type))
+            # check_tensor_node(d_from, 4)
+            # print(d_from.device)
+        else:
+            d_from = torch.rand(args.m, args.n).to(data_type).pin_memory()
+        barrier.wait()
+        start = time.time()
+        if args.bwshare == 1 or args.bwshare == 2:
+            for j in range(math.ceil(50*args.m)):
+                d_to = d_from.to('cuda')
+        end = time.time()
+        queue.put(end - start)
+        barrier.wait()
+
 # Repeat the time measurement process
 durations_compute = []
 durations_memcpy = []
+
+barrier = Barrier(2)
+memcpy_queue = Queue()
+memcpy_proc = Process(target=memcpy_process, args=(barrier, memcpy_queue, data_type, args, iterations))
+# memcpy_proc = Thread(target=memcpy_process, args=(barrier, memcpy_queue, data_type, args, iterations))
+memcpy_proc.start()
+
 for i in range(iterations):
-    # Generate random tensors
     if bmm:
-        a = torch.rand(bsz, m, n).to(data_type)
-        b = torch.rand(bsz, n, k).to(data_type)
+        a = torch.rand(args.bsz, args.m, args.n).to(data_type)
+        b = torch.rand(args.bsz, args.n, args.k).to(data_type)
     else:
-        a = torch.rand(m, n).to(data_type)
-        b = torch.rand(n, k).to(data_type)
-    
+        a = torch.rand(args.m, args.n).to(data_type)
+        b = torch.rand(args.n, args.k).to(data_type)
     if cxl:
         b = realloc_to_numa(b)
         # check_tensor_node(b, 6)
-    
-    # Generate data to be transferred
-    if bwshare == 1:
-        d_from = torch.rand(m, n).to(data_type).pin_memory()
-        d_to = torch.zeros(m, n).to(data_type).to('cuda:0')
-    elif bwshare == 2:
-        d_from = realloc_to_numa(torch.rand(m, n).to(data_type))
-        # check_tensor_node(d_from, 6)
-        d_to = torch.zeros(m, n).to(data_type).to('cuda:0')
-    
-    def memcpy(queue):
-        if bwshare == 1 or bwshare == 2:
-            start = time.time()
-            torch.cuda.synchronize()
-            for j in range(math.ceil(0.005*m)):
-                d_to.copy_(d_from, non_blocking=True)
-                torch.cuda.synchronize()
-            end = time.time()
-            queue.put(end - start)
-        else:
-            queue.put(0)
-    
-    memcpy_queue = Queue()
-    memcpy_thread = Thread(target=memcpy, args=(memcpy_queue,))
-    memcpy_thread.start()
 
-    # Measure time
-    
-    if amx:
+    barrier.wait()
+
+    if args.amx:
         with torch.cpu.amp.autocast():
-            if bmm:
+            if args.bmm:
                 start = time.time()
                 c = torch.bmm(a, b)
                 end = time.time()
@@ -98,7 +101,7 @@ for i in range(iterations):
                 c = torch.matmul(a, b)
                 end = time.time()
     else:
-        if bmm:
+        if args.bmm:
             start = time.time()
             c = torch.bmm(a, b)
             end = time.time()
@@ -106,19 +109,20 @@ for i in range(iterations):
             start = time.time()
             c = torch.matmul(a, b)
             end = time.time()
-            
-    memcpy_thread.join()
+
+    barrier.wait()
+
+    compute_time = end - start
     memcpy_time = memcpy_queue.get()
 
-    # Accumulate duration
-    compute_time = end - start
     if i > warmup - 1:
         durations_compute.append(compute_time)
         durations_memcpy.append(memcpy_time)
+        print(f"Iteration {i - warmup}: output data type: {data_type}, Compute: {compute_time:.6f} s , Memcpy: {memcpy_time:.6f} s")
+    # else:
+    #     print(f"Iteration {i - warmup}: output data type: {data_type}, Compute: {compute_time:.6f} s , Memcpy: {memcpy_time:.6f} s")
 
-        print(f"Iteration {i - warmup}: output data type: {c.dtype}, Compute: {compute_time:.6f} s , Memcpy: {memcpy_time:.6f} s")
-    else:
-        print(f"Iteration {i - warmup}: output data type: {c.dtype}, Compute: {compute_time:.6f} s , Memcpy: {memcpy_time:.6f} s")
+memcpy_proc.join()
 
 # Calculate average duration and GFLOPS
 average_duration_compute = np.median(durations_compute)
