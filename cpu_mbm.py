@@ -6,6 +6,7 @@ import numpy as np
 import math
 import os
 import psutil
+import torch.cuda as cuda
 
 from multiprocessing import Process, Queue, Barrier
 # from threading import Thread, Barrier
@@ -50,19 +51,38 @@ data_type = torch.bfloat16 if amx else torch.float32
 
 def memcpy_process(barrier, queue, data_type, args, iterations):
     p = psutil.Process(os.getpid())
-    p.cpu_affinity([0])
-    for i in range(iterations):
+    try:
         if args.bwshare == 2:
-            d_from = realloc_to_numa(torch.rand(args.m, args.n).to(data_type))
-            # check_tensor_node(d_from, 4)
-            # print(d_from.device)
+            p.cpu_affinity([40])
         else:
-            d_from = torch.rand(args.m, args.n).to(data_type).pin_memory()
+            p.cpu_affinity([0])
+    except Exception as e:
+        print(f"Failed to set affinity: {str(e)}")
+    parent_priority = psutil.Process(os.getppid()).nice()
+    p.nice(parent_priority)
+    priority = psutil.Process(os.getppid()).nice()
+    affinity = p.cpu_affinity()
+    print(f"[Transfer Process] Prio: {priority}, Affi: {affinity}")
+
+    transfer_stream = cuda.Stream()
+    if args.bwshare == 1:
+        d_from = torch.rand(args.bsz * args.m * args.n).to(data_type).pin_memory()
+    if args.bwshare == 2:
+        d_from = realloc_to_numa(torch.rand(args.bsz * args.m * args.n).to(data_type))
+    
+    barrier.wait()
+    if args.bwshare == 1 or args.bwshare == 2:
+        print("Tensor D:")
+        check_tensor_node(d_from, 4)
+
+    for i in range(iterations):
         barrier.wait()
         start = time.time()
         if args.bwshare == 1 or args.bwshare == 2:
-            for j in range(math.ceil(50*args.m)):
-                d_to = d_from.to('cuda')
+            with cuda.stream(transfer_stream):
+                for j in range(80):
+                    d_to = d_from.to('cuda', non_blocking=True)
+                    torch.cuda.synchronize()
         end = time.time()
         queue.put(end - start)
         barrier.wait()
@@ -71,22 +91,33 @@ def memcpy_process(barrier, queue, data_type, args, iterations):
 durations_compute = []
 durations_memcpy = []
 
+p = psutil.Process(os.getpid())
+p.nice(0)
+priority = psutil.Process(os.getppid()).nice()
+affinity = p.cpu_affinity()
+print(f"[Compute  Process] Prio: {priority}, Affi: {affinity}")
+
 barrier = Barrier(2)
 memcpy_queue = Queue()
 memcpy_proc = Process(target=memcpy_process, args=(barrier, memcpy_queue, data_type, args, iterations))
-# memcpy_proc = Thread(target=memcpy_process, args=(barrier, memcpy_queue, data_type, args, iterations))
 memcpy_proc.start()
 
+if bmm:
+    a = torch.rand(args.bsz, args.m, args.n).to(data_type)
+    b = torch.rand(args.bsz, args.n, args.k).to(data_type)
+else:
+    a = torch.rand(args.m, args.n).to(data_type)
+    b = torch.rand(args.n, args.k).to(data_type)
+if cxl:
+    b = realloc_to_numa(b)
+
+print("Tensor A:")
+check_tensor_node(a, 4)
+print("Tensor B:")
+check_tensor_node(b, 4)
+barrier.wait()
+
 for i in range(iterations):
-    if bmm:
-        a = torch.rand(args.bsz, args.m, args.n).to(data_type)
-        b = torch.rand(args.bsz, args.n, args.k).to(data_type)
-    else:
-        a = torch.rand(args.m, args.n).to(data_type)
-        b = torch.rand(args.n, args.k).to(data_type)
-    if cxl:
-        b = realloc_to_numa(b)
-        # check_tensor_node(b, 6)
 
     barrier.wait()
 
@@ -132,4 +163,4 @@ gflops = n_comp / average_duration_compute / 10**9
 
 print(f"Average Compute: {average_duration_compute:.6f} s")
 print(f"Average Memcpy: {average_duration_memcpy:.6f} s")
-print(f"Throughput: {gflops} (GFLOPS)")
+print(f"Throughput: {gflops:.6f} (GFLOPS)")
